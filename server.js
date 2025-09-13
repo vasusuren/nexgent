@@ -1,5 +1,5 @@
 const express = require('express');
-const { Connection, Keypair, Transaction } = require('@solana/web3.js');
+const { Connection, Keypair, Transaction, VersionedTransaction } = require('@solana/web3.js');
 const bs58 = require('bs58');
 require('dotenv').config();
 
@@ -174,11 +174,25 @@ async function executeSwap(signedTransactionBase64, requestId) {
 }
 
 // Function to sign transaction
+// Replace your signTransaction function with this updated version:
 function signTransaction(transactionBase64) {
     try {
-        const transaction = Transaction.from(Buffer.from(transactionBase64, 'base64'));
-        transaction.sign(wallet);
-        return transaction.serialize().toString('base64');
+        const transactionBuffer = Buffer.from(transactionBase64, 'base64');
+        
+        // Try versioned transaction first (Jupiter Ultra API uses these)
+        try {
+            const { VersionedTransaction } = require('@solana/web3.js');
+            const versionedTransaction = VersionedTransaction.deserialize(transactionBuffer);
+            versionedTransaction.sign([wallet]);
+            return Buffer.from(versionedTransaction.serialize()).toString('base64');
+        } catch (versionedError) {
+            console.log('Not a versioned transaction, trying legacy format...');
+            
+            // Fallback to legacy transaction
+            const transaction = Transaction.from(transactionBuffer);
+            transaction.sign(wallet);
+            return transaction.serialize().toString('base64');
+        }
     } catch (error) {
         console.error('Error signing transaction:', error);
         throw error;
