@@ -199,7 +199,6 @@ function signTransaction(transactionBase64) {
     }
 }
 
-// Function to process agent transaction event
 async function processAgentTransaction(eventData) {
     const { data } = eventData;
     
@@ -209,18 +208,28 @@ async function processAgentTransaction(eventData) {
         input_symbol: data.input_symbol,
         output_symbol: data.output_symbol,
         input_amount: data.input_amount,
-        output_amount: data.output_amount
+        input_mint: data.input_mint,
+        output_mint: data.output_mint
     });
     
-    // Convert input amount to lamports/smallest unit
-    // Assuming input_amount is in token units, need to convert to base units
-    const inputAmountLamports = Math.floor(data.input_amount * Math.pow(10, 9)); // Assuming 9 decimals for SOL
-    
-    // Calculate slippage from the provided data
-    const slippageBps = data.slippage ? Math.floor(data.slippage * 10000) : 50; // Default 0.5%
-    
     try {
-        // Get swap order from Jupiter
+        // Dynamically fetch token decimals
+        console.log('🔍 Fetching token decimals...');
+        const inputDecimals = await getTokenDecimals(data.input_mint);
+        console.log(`💰 Token ${data.input_symbol} (${data.input_mint}) has ${inputDecimals} decimals`);
+        
+        // Convert amount using correct decimals
+        const inputAmountLamports = Math.floor(data.input_amount * Math.pow(10, inputDecimals));
+        
+        console.log('💱 Amount conversion:', {
+            originalAmount: data.input_amount,
+            decimals: inputDecimals,
+            convertedAmount: inputAmountLamports,
+            symbol: data.input_symbol
+        });
+        
+        const slippageBps = data.slippage ? Math.floor(data.slippage * 10000) : 300; // 3% default
+        
         const orderResponse = await getSwapOrder(
             data.input_mint,
             data.output_mint,
@@ -229,13 +238,22 @@ async function processAgentTransaction(eventData) {
         );
         
         if (!orderResponse.transaction) {
-            throw new Error('No transaction received from Jupiter API');
+            return {
+                success: false,
+                transactionId: data.id,
+                error: 'No executable transaction from Jupiter API',
+                details: {
+                    inputAmount: data.input_amount,
+                    convertedAmount: inputAmountLamports,
+                    decimals: inputDecimals,
+                    priceImpact: orderResponse.priceImpactPct,
+                    hasRoute: !!orderResponse.routePlan
+                }
+            };
         }
         
-        // Sign the transaction
+        // Continue with transaction signing and execution...
         const signedTransaction = signTransaction(orderResponse.transaction);
-        
-        // Execute the swap
         const executeResponse = await executeSwap(signedTransaction, orderResponse.requestId);
         
         return {
@@ -246,8 +264,10 @@ async function processAgentTransaction(eventData) {
             signature: executeResponse.signature,
             inputAmount: orderResponse.inAmount,
             outputAmount: orderResponse.outAmount,
-            priceImpact: orderResponse.priceImpactPct
+            priceImpact: orderResponse.priceImpactPct,
+            decimalsUsed: inputDecimals
         };
+        
     } catch (error) {
         console.error('Error processing agent transaction:', error);
         return {
@@ -256,6 +276,58 @@ async function processAgentTransaction(eventData) {
             error: error.message
         };
     }
+}
+
+// Add this function to fetch token decimals dynamically
+async function getTokenDecimals(tokenMint) {
+    try {
+        // Try Jupiter's token info API first
+        console.log(`🔍 Fetching decimals for token: ${tokenMint}`);
+        
+        const response = await fetch(`https://tokens.jup.ag/token/${tokenMint}`);
+        if (response.ok) {
+            const tokenInfo = await response.json();
+            console.log(`✅ Token info from Jupiter:`, tokenInfo);
+            return tokenInfo.decimals;
+        }
+    } catch (error) {
+        console.log('⚠️ Jupiter token API failed, trying alternative...');
+    }
+    
+    try {
+        // Alternative: Use Solana token list
+        const response = await fetch('https://token.jup.ag/all');
+        if (response.ok) {
+            const allTokens = await response.json();
+            const token = allTokens.find(t => t.address === tokenMint);
+            if (token) {
+                console.log(`✅ Found token in Jupiter list:`, token);
+                return token.decimals;
+            }
+        }
+    } catch (error) {
+        console.log('⚠️ Jupiter token list failed');
+    }
+    
+    // Fallback: Query Solana RPC directly
+    try {
+        console.log('🔄 Querying Solana RPC for mint info...');
+        const connection = new Connection('https://api.mainnet-beta.solana.com');
+        const { PublicKey } = require('@solana/web3.js');
+        
+        const mintInfo = await connection.getParsedAccountInfo(new PublicKey(tokenMint));
+        if (mintInfo.value && mintInfo.value.data.parsed) {
+            const decimals = mintInfo.value.data.parsed.info.decimals;
+            console.log(`✅ Got decimals from Solana RPC: ${decimals}`);
+            return decimals;
+        }
+    } catch (error) {
+        console.log('⚠️ Solana RPC failed:', error.message);
+    }
+    
+    // Final fallback
+    console.log('⚠️ Using default 6 decimals');
+    return 6;
 }
 
 // Function to process trade signal event
