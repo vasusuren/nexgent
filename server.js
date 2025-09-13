@@ -228,7 +228,28 @@ async function processAgentTransaction(eventData) {
             symbol: data.input_symbol
         });
         
-        const slippageBps = data.slippage ? Math.floor(data.slippage * 10000) : 300; // 3% default
+        let slippageBps;
+        const isSellingToSOL = data.output_mint === 'So11111111111111111111111111111111111111112';
+        const isPumpFunToken = data.input_mint.endsWith('pump') || data.input_symbol.toLowerCase().includes('pump');
+
+        if (isSellingToSOL) {
+            // Higher slippage for selling tokens (especially to SOL)
+            if (isPumpFunToken) {
+                slippageBps = 1000; // 10% for pump.fun token sales
+            } else {
+                slippageBps = 500;  // 5% for regular token sales
+            }
+        } else {
+            // Lower slippage for buying tokens with SOL  
+            slippageBps = data.slippage ? Math.floor(data.slippage * 10000) : 300; // 3%
+        }
+
+        console.log(`📊 Slippage strategy:`, {
+            direction: isSellingToSOL ? 'SELL → SOL' : 'BUY with SOL',
+            isPumpFun: isPumpFunToken,
+            slippageBps: slippageBps,
+            slippagePercent: `${slippageBps/100}%`
+        });
         
         const orderResponse = await getSwapOrder(
             data.input_mint,
