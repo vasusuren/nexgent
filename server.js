@@ -991,8 +991,13 @@ app.get('/balance', async (req, res) => {
         
         res.json({
             wallet: walletAddress,
-            holdings: holdingsResponse.holdings || holdingsResponse,
-            timestamp: new Date().toISOString()
+            holdings: holdingsResponse, // Return raw structure for debugging
+            timestamp: new Date().toISOString(),
+            structure: {
+                hasTokens: !!holdingsResponse.tokens,
+                tokenCount: holdingsResponse.tokens ? Object.keys(holdingsResponse.tokens).length : 0,
+                sampleTokens: holdingsResponse.tokens ? Object.keys(holdingsResponse.tokens).slice(0, 3) : []
+            }
         });
     } catch (error) {
         console.error('Error fetching actual balance:', error);
