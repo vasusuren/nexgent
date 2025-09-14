@@ -242,7 +242,7 @@ async function getActualTokenBalance(tokenMint) {
         const holdingsResponse = await makeJupiterRequest(`/ultra/v1/holdings/${walletAddress}`);
         
         // Handle the actual Jupiter API structure: holdings.tokens[tokenMint][0]
-        const tokens = holdingsResponse.holdings?.tokens || {};
+        const tokens = holdingsResponse.holdings.tokens || {};
         const tokenArray = tokens[tokenMint];
         
         if (!tokenArray || tokenArray.length === 0) {
