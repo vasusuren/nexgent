@@ -241,10 +241,11 @@ async function getActualTokenBalance(tokenMint) {
         
         const holdingsResponse = await makeJupiterRequest(`/ultra/v1/holdings/${walletAddress}`);
         
-        // Find the specific token in holdings
-        const tokenHolding = holdingsResponse.holdings?.find(holding => holding.mint === tokenMint);
+        // Handle the actual Jupiter API structure: holdings.tokens[tokenMint][0]
+        const tokens = holdingsResponse.holdings?.tokens || {};
+        const tokenArray = tokens[tokenMint];
         
-        if (!tokenHolding) {
+        if (!tokenArray || tokenArray.length === 0) {
             console.log(`⚠️ Token ${tokenMint} not found in wallet holdings`);
             return {
                 amount: "0",
@@ -254,18 +255,22 @@ async function getActualTokenBalance(tokenMint) {
             };
         }
         
+        // Get the first (and usually only) token account
+        const tokenHolding = tokenArray[0];
+        
         console.log(`✅ Found actual token balance:`, {
-            symbol: tokenHolding.symbol,
+            mint: tokenMint,
             amount: tokenHolding.amount,
             uiAmount: tokenHolding.uiAmount,
-            decimals: tokenHolding.decimals
+            decimals: tokenHolding.decimals,
+            account: tokenHolding.account
         });
         
         return {
             amount: tokenHolding.amount,
             uiAmount: tokenHolding.uiAmount,
             decimals: tokenHolding.decimals,
-            symbol: tokenHolding.symbol,
+            account: tokenHolding.account,
             found: true
         };
     } catch (error) {
@@ -361,8 +366,27 @@ async function calculateExitStrategy(webhookAmount, tokenMint, tokenSymbol, agen
         const actualBalance = await getActualTokenBalance(tokenMint);
         
         if (!actualBalance.found || actualBalance.uiAmount === 0) {
-            console.log('❌ No actual balance found, cannot execute exit');
-            throw new Error(`No balance found for token ${tokenMint} in actual wallet`);
+            console.log('⚠️ Token not found in Jupiter holdings API');
+            console.log('🔄 This could be due to: API lag, very small amounts, or new/unlisted token');
+            
+            // In fallback mode, if token not found, skip the transaction gracefully
+            if (!virtualBalanceFetchSuccess) {
+                console.log('📋 FALLBACK: Skipping transaction - token not found and virtual balance unavailable');
+                return {
+                    success: false,
+                    error: `Token ${tokenSymbol} not found in wallet holdings (Jupiter API). This could be due to API lag, very small amounts, or unlisted token.`,
+                    skipped: true,
+                    reason: 'TOKEN_NOT_FOUND_IN_HOLDINGS',
+                    suggestions: [
+                        'Check if token exists in wallet manually',
+                        'Wait a few minutes for Jupiter API to update',
+                        'Verify token mint address is correct'
+                    ]
+                };
+            }
+            
+            // If we have virtual balance but no actual balance, it's a real problem
+            throw new Error(`No balance found for token ${tokenMint} in actual wallet - check if you actually hold this token`);
         }
         
         let exitStrategy;
