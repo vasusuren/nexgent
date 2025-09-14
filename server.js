@@ -327,22 +327,35 @@ function isExitTransaction(inputMint, outputMint) {
     return outputMint === SOL_MINT && inputMint !== SOL_MINT;
 }
 
-// Function to calculate exit percentage and amount based on virtual agent balance
+// Function to calculate exit strategy with simple fallback
 async function calculateExitStrategy(webhookAmount, tokenMint, tokenSymbol, agentId) {
     try {
         console.log(`📊 Calculating exit strategy for ${tokenSymbol}`);
         console.log(`   Webhook amount: ${webhookAmount}`);
         
-        // Get virtual agent's current balance
-        const virtualBalances = await getVirtualAgentBalance(agentId);
-        const virtualBalance = findVirtualTokenBalance(virtualBalances, tokenMint, tokenSymbol);
+        let virtualBalance = 0;
+        let virtualBalanceFetchSuccess = false;
         
-        console.log(`📈 Virtual agent balance analysis:`, {
-            tokenMint: tokenMint,
-            tokenSymbol: tokenSymbol,
-            virtualBalance: virtualBalance,
-            webhookAmount: webhookAmount
-        });
+        // Try to get virtual agent's current balance with fallback handling
+        try {
+            const virtualBalances = await getVirtualAgentBalance(agentId);
+            virtualBalance = findVirtualTokenBalance(virtualBalances, tokenMint, tokenSymbol);
+            virtualBalanceFetchSuccess = true;
+            
+            console.log(`📈 Virtual agent balance fetched successfully:`, {
+                tokenMint: tokenMint,
+                tokenSymbol: tokenSymbol,
+                virtualBalance: virtualBalance,
+                webhookAmount: webhookAmount
+            });
+            
+        } catch (virtualBalanceError) {
+            console.log(`⚠️ Failed to fetch virtual balance for agent ${agentId}:`, virtualBalanceError.message);
+            console.log(`🔄 Using simple fallback strategy: compare actual balance vs webhook amount`);
+            
+            virtualBalance = 0; // Set to zero to trigger fallback logic
+            virtualBalanceFetchSuccess = false;
+        }
         
         // Get actual wallet balance
         const actualBalance = await getActualTokenBalance(tokenMint);
@@ -356,7 +369,29 @@ async function calculateExitStrategy(webhookAmount, tokenMint, tokenSymbol, agen
         let percentageToSell;
         let amountToSell;
         
-        if (virtualBalance === 0) {
+        if (!virtualBalanceFetchSuccess) {
+            // SIMPLE FALLBACK STRATEGY: Virtual balance unavailable
+            console.log('🔄 FALLBACK: Virtual balance unavailable - using simple exit strategy');
+            console.log(`   Comparing: actual balance (${actualBalance.uiAmount}) vs webhook amount (${webhookAmount})`);
+            
+            if (actualBalance.uiAmount <= webhookAmount) {
+                // Actual balance is less than or equal to webhook amount - exit entire position
+                exitStrategy = 'FALLBACK_EXIT_ALL';
+                percentageToSell = 1.0;
+                amountToSell = actualBalance.uiAmount;
+                
+                console.log(`✅ Actual balance (${actualBalance.uiAmount}) ≤ webhook amount (${webhookAmount}) - exiting ALL actual balance`);
+                
+            } else {
+                // Actual balance is greater than webhook amount - exit webhook amount
+                exitStrategy = 'FALLBACK_EXIT_WEBHOOK';
+                percentageToSell = webhookAmount / actualBalance.uiAmount;
+                amountToSell = webhookAmount;
+                
+                console.log(`✅ Actual balance (${actualBalance.uiAmount}) > webhook amount (${webhookAmount}) - exiting webhook amount`);
+            }
+            
+        } else if (virtualBalance === 0) {
             // Virtual agent has zero balance - exit full position
             exitStrategy = 'FULL_EXIT_ZERO_VIRTUAL';
             percentageToSell = 1.0;
@@ -409,7 +444,9 @@ async function calculateExitStrategy(webhookAmount, tokenMint, tokenSymbol, agen
             actualBalance: actualBalance.uiAmount,
             virtualBalance: virtualBalance,
             webhookAmount: webhookAmount,
-            willSellAll: percentageToSell >= 0.99
+            willSellAll: percentageToSell >= 0.99,
+            virtualBalanceAvailable: virtualBalanceFetchSuccess,
+            fallbackMode: !virtualBalanceFetchSuccess
         };
         
     } catch (error) {
@@ -550,8 +587,16 @@ async function processAgentTransaction(eventData) {
                 webhookAmount: exitCalculation.webhookAmount,
                 percentageToSell: `${(exitCalculation.percentageToSell * 100).toFixed(2)}%`,
                 amountToSell: exitCalculation.amountToSellUI,
-                willSellAll: exitCalculation.willSellAll
+                willSellAll: exitCalculation.willSellAll,
+                virtualBalanceAvailable: exitCalculation.virtualBalanceAvailable,
+                fallbackMode: exitCalculation.fallbackMode
             });
+            
+            if (exitCalculation.fallbackMode) {
+                console.log('⚠️ SIMPLE FALLBACK MODE: Virtual balance unavailable');
+                console.log(`   → Exiting ${exitCalculation.strategy === 'FALLBACK_EXIT_ALL' ? 'ALL actual balance' : 'webhook amount'}`);
+                console.log(`   → Amount: ${exitCalculation.amountToSellUI} (${(exitCalculation.percentageToSell * 100).toFixed(1)}% of holdings)`);
+            }
             
         } else {
             // Regular transaction (entry) - use webhook amount as-is
@@ -644,8 +689,17 @@ async function processAgentTransaction(eventData) {
                 webhookAmount: exitStrategy.webhookAmount,
                 percentageSold: `${(exitStrategy.percentageToSell * 100).toFixed(2)}%`,
                 amountSold: exitStrategy.amountToSellUI,
-                soldAll: exitStrategy.willSellAll
+                soldAll: exitStrategy.willSellAll,
+                virtualBalanceAvailable: exitStrategy.virtualBalanceAvailable,
+                fallbackMode: exitStrategy.fallbackMode
             };
+            
+            if (exitStrategy.fallbackMode) {
+                result.exitStrategyInfo.fallbackReason = 'Virtual balance unavailable - exiting lower of (actual balance, webhook amount)';
+                result.exitStrategyInfo.fallbackLogic = exitStrategy.strategy === 'FALLBACK_EXIT_ALL' ? 
+                    'Actual ≤ Webhook → Exit all actual balance' : 
+                    'Actual > Webhook → Exit webhook amount';
+            }
         }
         
         return result;
@@ -672,16 +726,59 @@ async function processTradeSignal(eventData) {
         token_symbol: data.token_symbol,
         token_address: data.token_address,
         price_at_signal: data.price_at_signal,
-        activation_reason: data.activation_reason
+        activation_reason: data.activation_reason,
+        trade_amount: data.trade_amount,
+        input_mint: data.input_mint,
+        input_symbol: data.input_symbol
     });
     
-    // Default trade amount (configurable)
-    const SOL_TRADE_AMOUNT = 0.1; // 0.1 SOL
-    const inputAmountLamports = Math.floor(SOL_TRADE_AMOUNT * Math.pow(10, 9));
+    // Determine trade amount - prioritize webhook data, fall back to defaults
+    let inputMint, inputAmountLamports, inputSymbol;
     
-    const inputMint = 'So11111111111111111111111111111111111111112'; // SOL
+    if (data.trade_amount && data.input_mint) {
+        // Use amount and token from webhook
+        inputMint = data.input_mint;
+        inputSymbol = data.input_symbol || 'UNKNOWN';
+        
+        // Get decimals for the input token
+        const decimals = await getTokenDecimals(data.input_mint);
+        inputAmountLamports = Math.floor(data.trade_amount * Math.pow(10, decimals));
+        
+        console.log('📊 Using webhook trade amount:', {
+            inputMint: inputMint,
+            inputSymbol: inputSymbol,
+            amount: data.trade_amount,
+            decimals: decimals,
+            amountInLamports: inputAmountLamports
+        });
+        
+    } else if (data.trade_amount) {
+        // Amount provided but no input mint - assume SOL
+        inputMint = 'So11111111111111111111111111111111111111112';
+        inputSymbol = 'SOL';
+        inputAmountLamports = Math.floor(data.trade_amount * Math.pow(10, 9)); // SOL has 9 decimals
+        
+        console.log('📊 Using webhook SOL amount:', {
+            amount: data.trade_amount,
+            amountInLamports: inputAmountLamports
+        });
+        
+    } else {
+        // No amount in webhook - use configurable default
+        const DEFAULT_SOL_AMOUNT = parseFloat(process.env.DEFAULT_TRADE_AMOUNT) || 0.1;
+        inputMint = 'So11111111111111111111111111111111111111112';
+        inputSymbol = 'SOL';
+        inputAmountLamports = Math.floor(DEFAULT_SOL_AMOUNT * Math.pow(10, 9));
+        
+        console.log('⚠️ No trade amount in webhook, using default:', {
+            defaultAmount: DEFAULT_SOL_AMOUNT,
+            amountInLamports: inputAmountLamports,
+            note: 'Set DEFAULT_TRADE_AMOUNT env var to change default'
+        });
+    }
+    
     const outputMint = data.token_address;
-    const slippageBps = 100; // 1% slippage for trade signals
+    const slippageBps = data.slippage ? Math.floor(data.slippage * 10000) : 100; // Use webhook slippage or 1% default
     
     try {
         const orderResponse = await getSwapOrder(
@@ -798,9 +895,9 @@ app.get('/', (req, res) => {
         wallet: wallet.publicKey.toString(),
         features: [
             'Virtual agent balance synchronization',
-            'Intelligent exit percentage calculation', 
-            'Full position exits when virtual balance is zero',
-            'Partial exits based on virtual agent intent'
+            'Simple fallback strategy when virtual balance unavailable', 
+            'Exit strategy: min(actual balance, webhook amount)',
+            'Dynamic trade amounts for signals'
         ],
         endpoints: {
             'GET /': 'Server information and available endpoints',
@@ -808,6 +905,7 @@ app.get('/', (req, res) => {
             'GET /balance': 'Get actual wallet token balances',
             'GET /virtual-balance/:agentId': 'Get virtual agent balance',
             'GET /balance-comparison/:agentId': 'Compare virtual vs actual balances',
+            'GET /debug-agent/:agentId': 'Debug agent access and API connectivity',
             'POST /webhook': 'Main webhook endpoint for processing events',
             'POST /test-swap': 'Test swap endpoint',
             'POST /test-exit': 'Test exit strategy calculation'
@@ -826,6 +924,23 @@ app.get('/', (req, res) => {
                     output_mint: 'So11111111111111111111111111111111111111112',
                     output_symbol: 'SOL',
                     slippage: 0.005
+                }
+            },
+            tradeSignals: {
+                event: 'tradeSignals',
+                timestamp: '2024-01-01T12:00:00.000Z',
+                agentId: 'agent-uuid-required',
+                data: {
+                    id: 123,
+                    token_address: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+                    token_symbol: 'USDC',
+                    price_at_signal: 1.0001,
+                    activation_reason: 'Breakout signal detected',
+                    // New dynamic fields for trade signals:
+                    trade_amount: 0.5,  // Amount to trade (0.5 SOL in this example)
+                    input_mint: 'So11111111111111111111111111111111111111112',  // Token to trade with (SOL)
+                    input_symbol: 'SOL',  // Symbol of input token
+                    slippage: 0.01  // 1% slippage tolerance
                 }
             }
         }
@@ -943,7 +1058,71 @@ app.get('/balance-comparison/:agentId', async (req, res) => {
     }
 });
 
-// Test exit strategy calculation
+// Debug endpoint to check agent access
+app.get('/debug-agent/:agentId', async (req, res) => {
+    try {
+        const { agentId } = req.params;
+        
+        console.log(`🔍 Debug: Testing access to agent ${agentId}`);
+        
+        const debugInfo = {
+            agentId: agentId,
+            timestamp: new Date().toISOString(),
+            tests: {}
+        };
+        
+        // Test 1: Try to get virtual balance
+        try {
+            const virtualBalances = await getVirtualAgentBalance(agentId);
+            debugInfo.tests.virtualBalance = {
+                success: true,
+                tokenCount: virtualBalances.balances?.length || 0,
+                balances: virtualBalances.balances || []
+            };
+        } catch (error) {
+            debugInfo.tests.virtualBalance = {
+                success: false,
+                error: error.message,
+                httpStatus: error.message.includes('404') ? '404 Not Found' : 'Other Error'
+            };
+        }
+        
+        // Test 2: Check if it's a valid UUID format
+        const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        debugInfo.tests.uuidFormat = {
+            valid: uuidRegex.test(agentId),
+            format: agentId.match(uuidRegex) ? 'Valid UUID v4' : 'Invalid UUID format'
+        };
+        
+        // Test 3: API configuration check
+        debugInfo.tests.apiConfig = {
+            nexgentApiKey: !!NEXGENT_API_KEY,
+            nexgentBaseUrl: NEXGENT_BASE_URL,
+            mockMode: MOCK_MODE
+        };
+        
+        // Summary
+        debugInfo.summary = {
+            agentAccessible: debugInfo.tests.virtualBalance.success,
+            recommendation: debugInfo.tests.virtualBalance.success ? 
+                'Agent is accessible - issue may be elsewhere' :
+                debugInfo.tests.virtualBalance.httpStatus === '404 Not Found' ?
+                    'Agent ID not found - check if agent exists in your Nexgent Portal' :
+                    'API or authentication issue - check API key and permissions'
+        };
+        
+        res.json(debugInfo);
+        
+    } catch (error) {
+        console.error('Debug agent error:', error);
+        res.status(500).json({
+            error: 'Debug test failed',
+            message: error.message
+        });
+    }
+});
+
+// Test exit strategy calculation  
 app.post('/test-exit', async (req, res) => {
     try {
         const { agentId, tokenMint, tokenSymbol, webhookAmount } = req.body;
